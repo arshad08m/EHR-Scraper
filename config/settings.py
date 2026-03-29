@@ -52,10 +52,12 @@ class Settings:
     JSONL_OUTPUT:    Path = Path("data/orders_output.jsonl")
 
     # ── Scraper behaviour ─────────────────────────────────────────────────────
-    REQUEST_DELAY: float = float(os.getenv("REQUEST_DELAY_SECONDS", "1.5"))
+    REQUEST_DELAY: float = float(os.getenv("REQUEST_DELAY_SECONDS", "0.3"))
     MAX_RETRIES:   int   = int(os.getenv("MAX_RETRIES",             "3"))
     MAX_DOCS:      int   = int(os.getenv("MAX_DOCS",                "0"))  # 0 = unlimited, >0 = test mode
     PAGE_SIZE:     int   = _env_int("PAGE_SIZE",                    "100")
+    CAPTURE_CONCURRENCY: int = _env_int("CAPTURE_CONCURRENCY",      "2")
+    DIRECT_DOWNLOAD_ONLY: bool = _env_bool("DIRECT_DOWNLOAD_ONLY",   "true")
     ENABLE_DATA_EXTRACTION: bool = _env_bool("ENABLE_DATA_EXTRACTION", "false")
 
     # ── Ollama Vision extraction ─────────────────────────────────────────────

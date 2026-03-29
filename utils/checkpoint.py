@@ -40,8 +40,11 @@ def _load() -> dict:
 
 def _save(data: dict):
     _CP_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(_CP_FILE, "w") as f:
+    tmp_path = _CP_FILE.with_suffix(".tmp")
+    with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+    tmp_path.replace(_CP_FILE)
 
 
 def is_month_done(month: str) -> bool:
@@ -182,7 +185,7 @@ def mark_order_failed(order_number: str):
     data = _load()
     if order_number not in data["failed_orders"]:
         data["failed_orders"].append(order_number)
-    _save(data)
+        _save(data)
 
 
 def get_failed_orders() -> list:

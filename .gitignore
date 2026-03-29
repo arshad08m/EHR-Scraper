@@ -18,6 +18,7 @@ data/orders_output.jsonl
 data/orders_enriched.jsonl
 data/checkpoint.json
 /scripts/
+/data/
 
 # Logs
 logs/

@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import signal
+from pathlib import Path
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 from playwright.async_api import Page, BrowserContext, Response
@@ -18,10 +19,15 @@ from rich.console import Console
 
 from config.settings import settings
 from core.auth import ensure_logged_in
-from core.document_handler import capture_document, capture_document_from_url
+from core.document_handler import (
+    capture_document,
+    capture_document_from_url,
+    capture_document_direct_from_url,
+)
 from utils.checkpoint import (
     is_month_done, mark_month_done, update_progress,
     update_partial_progress, get_resume_state, mark_order_failed,
+    get_failed_orders, clear_failed,
 )
 from utils.storage import save_batch
 
@@ -147,44 +153,60 @@ async def scrape_month(context: BrowserContext, year: int, month: int):
                         f"[yellow]Resume skip on page {page_num}: {skipped} rows already processed in checkpoint.[/yellow]"
                     )
 
-            console.log(f"  Page {page_num}/{total_pages} — {len(rows_to_process)} rows to process ({len(rows)} total)")
+            if settings.MAX_DOCS > 0:
+                remaining = max(0, settings.MAX_DOCS - run_rows_saved)
+                rows_to_process = rows_to_process[:remaining]
+
+            total_to_process = len(rows_to_process)
+            console.log(f"  Page {page_num}/{total_pages} — {total_to_process} rows to process ({len(rows)} total)")
 
             enriched = []
-            for idx, row in enumerate(rows_to_process):
+            concurrency = max(1, int(settings.CAPTURE_CONCURRENCY or 1))
+            semaphore = asyncio.Semaphore(concurrency)
+
+            for batch_start in range(0, total_to_process, concurrency):
                 if _STOP_REQUESTED:
                     stopped_by_user = True
-                    console.log("[yellow]Stop requested (Ctrl+C). Finishing current page save...[/yellow]")
+                    console.log("[yellow]Stop requested (Ctrl+C). Finishing current batch save...[/yellow]")
                     break
 
-                order_num = str(row.get("order_number") or "").strip()
-                if not order_num:
-                    order_num = f"row_{page_num}_{idx + 1}"
-                console.log(f"    [{idx+1}/{len(rows_to_process)}] {order_num}")
-                try:
-                    doc_data = await _capture_document(context, page, row, idx, order_num)
-                    row.update(doc_data)
-                except Exception as e:
-                    console.log(f"    [red]Doc capture failed ({order_num}): {e}[/red]")
-                    mark_order_failed(order_num)
-                    row.update({"document_file_path": None})
+                batch_rows = rows_to_process[batch_start:batch_start + concurrency]
+                tasks = []
+                for offset, row in enumerate(batch_rows):
+                    idx = batch_start + offset
+                    order_num = str(row.get("order_number") or "").strip()
+                    if not order_num:
+                        order_num = f"row_{page_num}_{idx + 1}"
+                    console.log(f"    [{idx+1}/{total_to_process}] {order_num}")
+                    tasks.append(
+                        _capture_row_with_semaphore(
+                            semaphore,
+                            context,
+                            page,
+                            row,
+                            idx,
+                            order_num,
+                            month_key,
+                        )
+                    )
 
-                row["date_batch"] = month_key
-                enriched.append(row)
-                row_uid = _row_uid(row)
-                page_processed_uids.add(row_uid)
+                batch_results = await asyncio.gather(*tasks, return_exceptions=False)
+                for result_row, order_num, err in batch_results:
+                    if err:
+                        console.log(f"    [red]Doc capture failed ({order_num}): {err}[/red]")
+                        result_row["document_file_path"] = None
 
-                if _STOP_REQUESTED:
-                    stopped_by_user = True
-                    console.log("[yellow]Stop requested (Ctrl+C). Finishing current page save...[/yellow]")
-                    break
+                    if err or not result_row.get("document_file_path"):
+                        mark_order_failed(order_num)
 
-                await asyncio.sleep(settings.REQUEST_DELAY)
-                
-                # Check if we've hit the MAX_DOCS limit (testing mode)
-                total_processed = run_rows_saved + len(enriched)
-                if settings.MAX_DOCS > 0 and total_processed >= settings.MAX_DOCS:
-                    console.log(f"[yellow]Reached MAX_DOCS={settings.MAX_DOCS} (testing limit)[/yellow]")
-                    break
+                    enriched.append(result_row)
+                    page_processed_uids.add(_row_uid(result_row))
+
+                if settings.REQUEST_DELAY > 0:
+                    await asyncio.sleep(settings.REQUEST_DELAY)
+
+            if settings.MAX_DOCS > 0 and run_rows_saved + len(enriched) >= settings.MAX_DOCS:
+                console.log(f"[yellow]Reached MAX_DOCS={settings.MAX_DOCS} (testing limit)[/yellow]")
 
             save_batch(enriched)
             rows_saved += len(enriched)
@@ -235,6 +257,88 @@ async def scrape_month(context: BrowserContext, year: int, month: int):
 
     finally:
         await page.close()
+
+
+async def retry_failed_orders(
+    context: BrowserContext,
+    month_keys: set[str] | None = None,
+) -> dict:
+    """
+    Fast retry path for failed orders only.
+    Retries direct download using stored row metadata without paging through UI tables.
+    """
+    failed = get_failed_orders()
+    if not failed:
+        console.log("[green]No failed orders to retry.[/green]")
+        return {"attempted": 0, "recovered": 0, "remaining": 0}
+
+    records = _load_local_output_records()
+    if not records:
+        console.log("[yellow]No local output records found for failed-order retry.[/yellow]")
+        return {"attempted": 0, "recovered": 0, "remaining": len(failed)}
+
+    failed_set = set(failed)
+    candidates = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        order_num = str(record.get("order_number") or "").strip()
+        if not order_num or order_num not in failed_set:
+            continue
+        batch = str(record.get("date_batch") or "").strip()
+        if month_keys and batch not in month_keys:
+            continue
+        candidates.append(record)
+
+    if not candidates:
+        console.log("[yellow]No matching failed records found in local output for selected scope.[/yellow]")
+        return {"attempted": 0, "recovered": 0, "remaining": len(failed)}
+
+    recovered = 0
+    attempted = 0
+    for record in candidates:
+        order_num = str(record.get("order_number") or "").strip()
+        popup_url = str(record.get("document_popup_url") or record.get("document_url") or "").strip()
+        document_path = str(record.get("document_path") or "").strip()
+        if not popup_url:
+            continue
+
+        attempted += 1
+        console.log(f"[cyan]Retry failed order {order_num} ({attempted}/{len(candidates)})[/cyan]")
+        doc_result = await capture_document_direct_from_url(
+            context,
+            popup_url,
+            order_num,
+            document_path=document_path,
+            query_485_string=record.get("query_485_string"),
+            enable_popup_probe=True,
+        )
+        file_path = doc_result.get("document_file_path")
+        if not file_path:
+            await _ensure_retry_session(context)
+            console.log(f"[dim]Retry fallback: opening popup capture for {order_num}[/dim]")
+            try:
+                popup_result = await capture_document_from_url(context, popup_url, order_num)
+                if popup_result and popup_result.get("document_file_path"):
+                    doc_result = popup_result
+                    file_path = popup_result.get("document_file_path")
+            except Exception as e:
+                console.log(f"[dim]Retry popup fallback failed: {type(e).__name__}[/dim]")
+
+        if file_path:
+            record.update(doc_result)
+            save_batch([record])
+            clear_failed(order_num)
+            recovered += 1
+            console.log(f"[green]Recovered failed order {order_num}[/green]")
+        else:
+            console.log(f"[yellow]Still failed after retry: {order_num}[/yellow]")
+
+    remaining = len(get_failed_orders())
+    console.log(
+        f"[bold cyan]Failed-order retry complete: attempted={attempted}, recovered={recovered}, remaining={remaining}[/bold cyan]"
+    )
+    return {"attempted": attempted, "recovered": recovered, "remaining": remaining}
 
 
 # ── Filters ───────────────────────────────────────────────────────────────────
@@ -765,7 +869,18 @@ async def _capture_document(
 ) -> dict:
     popup_url = (row or {}).get("document_popup_url")
     if popup_url:
+        if settings.DIRECT_DOWNLOAD_ONLY:
+            return await capture_document_direct_from_url(
+                context,
+                popup_url,
+                order_number,
+                document_path=(row or {}).get("document_path"),
+                query_485_string=(row or {}).get("query_485_string"),
+            )
         return await capture_document_from_url(context, popup_url, order_number)
+
+    if settings.DIRECT_DOWNLOAD_ONLY:
+        return {"document_file_path": None}
 
     row_dom_id = (row or {}).get("row_dom_id")
     if row_dom_id:
@@ -783,6 +898,53 @@ async def _capture_document(
     if row_idx >= count:
         return {"document_file_path": None}
     return await capture_document(context, view_btns.nth(row_idx), order_number)
+
+
+def _load_local_output_records() -> list[dict]:
+    path = settings.JSON_OUTPUT
+    if not Path(path).exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, list):
+            return [r for r in raw if isinstance(r, dict)]
+    except Exception:
+        return []
+    return []
+
+
+async def _ensure_retry_session(context: BrowserContext):
+    """Open a probe page and re-authenticate if session has expired."""
+    page = await context.new_page()
+    try:
+        await page.goto(settings.WORLDVIEW_URL, wait_until="networkidle", timeout=30_000)
+        await ensure_logged_in(page)
+    finally:
+        await page.close()
+
+
+async def _capture_row_with_semaphore(
+    semaphore: asyncio.Semaphore,
+    context: BrowserContext,
+    page: Page,
+    row: dict,
+    row_idx: int,
+    order_num: str,
+    month_key: str,
+) -> tuple[dict, str, str | None]:
+    result_row = dict(row)
+    err = None
+
+    async with semaphore:
+        try:
+            doc_data = await _capture_document(context, page, result_row, row_idx, order_num)
+            result_row.update(doc_data)
+        except Exception as e:
+            err = str(e)
+
+    result_row["date_batch"] = month_key
+    return result_row, order_num, err
 
 
 # ── Pagination ────────────────────────────────────────────────────────────────
@@ -842,9 +1004,11 @@ async def _goto_next_page(page: Page) -> dict | None:
             except Exception:
                 await el.click()
                 response = None
-            await page.wait_for_load_state("networkidle", timeout=15_000)
             if response:
-                return await _parse_getdata_response(response, page.url, source="next")
+                parsed = await _parse_getdata_response(response, page.url, source="next")
+                if parsed:
+                    return parsed
+            await page.wait_for_load_state("networkidle", timeout=15_000)
             return None
     raise RuntimeError("Next Page button not found — run inspector.py.")
 

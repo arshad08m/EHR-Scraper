@@ -16,7 +16,7 @@ from rich.console import Console
 
 from config.settings import settings
 from core.auth import login
-from core.scraper import scrape_month
+from core.scraper import scrape_month, retry_failed_orders
 from utils.checkpoint import get_failed_orders
 
 console = Console()
@@ -79,6 +79,19 @@ async def main():
         login_page = await context.new_page()
         await login(login_page)
         await login_page.close()
+
+        if args.retry_failed:
+            month_keys = None
+            if args.month:
+                month_keys = {f"{y}-{mo:02d}" for y, mo in months}
+            await retry_failed_orders(context, month_keys=month_keys)
+            if not args.month:
+                await browser.close()
+                console.rule("[bold green]Run complete[/bold green]")
+                failed = get_failed_orders()
+                if failed:
+                    console.print(f"[yellow]{len(failed)} failed orders remain in utils/checkpoint.json[/yellow]")
+                return
 
         for year, month in months:
             try:

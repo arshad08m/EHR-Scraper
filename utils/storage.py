@@ -101,7 +101,7 @@ def _read_jsonl_lines(path: Path) -> list[dict]:
 
 def _load_local_records() -> list[dict]:
     records = _read_json_array(settings.JSON_OUTPUT)
-    if records:
+    if settings.JSON_OUTPUT.exists():
         return records
 
     legacy = _read_jsonl_lines(settings.JSONL_OUTPUT)
@@ -114,8 +114,11 @@ def _load_local_records() -> list[dict]:
 
 def _write_local_records(records: list[dict]):
     settings.JSON_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    with open(settings.JSON_OUTPUT, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
+    tmp_path = settings.JSON_OUTPUT.with_suffix(".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, separators=(",", ":"))
+        f.flush()
+    tmp_path.replace(settings.JSON_OUTPUT)
 
 
 def _upsert_local_records(incoming_records: list[dict]):

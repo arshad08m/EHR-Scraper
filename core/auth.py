@@ -18,6 +18,11 @@ console = Console()
 
 _LOGIN_FRAGMENT   = "Login.aspx"
 _SUCCESS_FRAGMENT = "WorldView"
+_LOGIN_URL_MARKERS = (
+    "login.aspx",
+    "/accounts/authorize",
+    "/identity/",
+)
 
 
 async def login(page: Page) -> bool:
@@ -84,12 +89,35 @@ async def ensure_logged_in(page: Page) -> bool:
     Returns True if session is alive.
     If not, re-logs in and returns False so caller can re-apply filters.
     """
-    if _LOGIN_FRAGMENT in page.url:
+    if _is_auth_page_url(page.url) or await _looks_like_login_form(page):
         console.log("[yellow]Session expired — re-logging in...[/yellow]")
         await login(page)
         await page.goto(settings.WORLDVIEW_URL, wait_until="networkidle", timeout=30_000)
         return False
     return True
+
+
+def _is_auth_page_url(url: str) -> bool:
+    lowered = str(url or "").lower()
+    return any(marker in lowered for marker in _LOGIN_URL_MARKERS)
+
+
+async def _looks_like_login_form(page: Page) -> bool:
+    # Some tenants route to auth URLs that do not contain Login.aspx.
+    # A password field on the root page is a reliable signal that auth is required.
+    selectors = [
+        "input[type='password']",
+        "input[name*='password' i]",
+        "#txtPassword",
+        "#Password",
+    ]
+    for sel in selectors:
+        try:
+            if await page.locator(sel).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 async def _find(page: Page, selectors: list):

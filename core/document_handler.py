@@ -31,6 +31,7 @@ import re
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.async_api import Page, BrowserContext
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -160,6 +161,62 @@ async def capture_document_from_url(context: BrowserContext, popup_url: str, ord
         return {**doc_result, **meta_result}
     finally:
         await popup.close()
+
+
+async def capture_document_direct_from_url(
+    context: BrowserContext,
+    popup_url: str,
+    order_number: str = None,
+    document_path: str | None = None,
+    query_485_string: str | None = None,
+    enable_popup_probe: bool = False,
+) -> dict:
+    """
+    Fast path: download directly from authenticated endpoints without opening popup.
+    If direct fetch fails, caller may mark order failed and continue.
+    """
+    console.log(f"  [dim]Direct capture: {popup_url}[/dim]")
+    try:
+        doc_result = await _try_popup_url(
+            context,
+            popup_url,
+            order_number,
+            query_485_string=query_485_string,
+        )
+    except Exception as e:
+        console.log(f"  [dim]Direct capture error: {type(e).__name__}[/dim]")
+        doc_result = None
+
+    if not doc_result and document_path:
+        try:
+            doc_result = await _try_document_path_url(
+                context,
+                popup_url,
+                document_path,
+                order_number,
+                query_485_string=query_485_string,
+            )
+        except Exception as e:
+            console.log(f"  [dim]Direct path fallback error: {type(e).__name__}[/dim]")
+            doc_result = None
+
+    if not doc_result and enable_popup_probe:
+        try:
+            doc_result = await _try_popup_probe_src(context, popup_url, order_number)
+        except Exception as e:
+            console.log(f"  [dim]Direct popup-probe error: {type(e).__name__}[/dim]")
+            doc_result = None
+
+    if not doc_result:
+        return {
+            "document_file_path": None,
+            "document_url": popup_url,
+        }
+
+    return {
+        **doc_result,
+        "document_url": popup_url,
+    }
 
 
 async def _extract_metadata_by_flag(popup: Page, document_file_path: str | None = None) -> dict:
@@ -457,23 +514,73 @@ async def _find_last_toolbar_button(popup: Page):
 # ── Strategy 2: fetch rendered document img/embed src ────────────────────────
 
 async def _try_fetch_doc_src(context: BrowserContext, popup: Page, order_number: str = None):
-    src = await popup.evaluate("""
-    () => {
-        const sels = %s;
-        for (const sel of sels) {
-            try {
-                const el = document.querySelector(sel);
-                if (el) {
-                    const s = el.src || el.data || el.getAttribute('src');
-                    if (s && s.length > 10) return s;
+    try:
+        src = await popup.evaluate(
+            """
+            (sels) => {
+                for (const sel of sels) {
+                    try {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            const s = el.src || el.data || el.getAttribute('src');
+                            if (s && s.length > 10) return s;
+                        }
+                    } catch (e) {}
                 }
-            } catch (e) {}
-        }
-        return null;
-    }
-    """ % str(_DOC_IMAGE_SELECTORS).replace("'", '"'))
+                return null;
+            }
+            """,
+            _DOC_IMAGE_SELECTORS,
+        )
+    except Exception as e:
+        console.log(f"  [dim]S2: selector probe failed: {type(e).__name__}[/dim]")
+        src = None
 
     if not src:
+        # Retry-only probe path sometimes renders the document in iframe/embed without matching
+        # the initial selectors. Collect additional candidate URLs and probe them directly.
+        extra_candidates = []
+        try:
+            extra_candidates = await popup.evaluate(
+                """
+                () => {
+                    const out = [];
+                    const seen = new Set();
+                    const add = (u) => {
+                        if (!u || typeof u !== 'string') return;
+                        const s = u.trim();
+                        if (!s || seen.has(s)) return;
+                        seen.add(s);
+                        out.push(s);
+                    };
+
+                    document.querySelectorAll('iframe[src], embed[src], object[data], a[href], img[src]').forEach((el) => {
+                        add(el.getAttribute('src') || el.getAttribute('data') || el.getAttribute('href'));
+                    });
+
+                    return out;
+                }
+                """
+            )
+        except Exception as e:
+            console.log(f"  [dim]S2: candidate probe failed: {type(e).__name__}[/dim]")
+
+        for candidate in extra_candidates:
+            resolved_candidate = urljoin(popup.url, candidate)
+            if not resolved_candidate:
+                continue
+
+            console.log(f"  [dim]S2: probing candidate {resolved_candidate[:50]}...[/dim]")
+            raw_candidate = await _fetch_authenticated(context, resolved_candidate, timeout=5_000)
+            if raw_candidate and raw_candidate.startswith(b"%PDF"):
+                pdf_dir = Path(settings.PDF_DIR)
+                pdf_dir.mkdir(parents=True, exist_ok=True)
+                filename = f"{order_number or 'doc'}.pdf"
+                filepath = pdf_dir / filename
+                filepath.write_bytes(raw_candidate)
+                console.log(f"  [green]✓ S2: Downloaded PDF {len(raw_candidate):,} bytes ({filename})[/green]")
+                return {"document_file_path": str(filepath)}
+
         console.log("  [dim]S2: no doc src found[/dim]")
         return None
 
@@ -500,7 +607,12 @@ async def _try_fetch_doc_src(context: BrowserContext, popup: Page, order_number:
 
 # ── Strategy 3: popup URL is the document ────────────────────────────────────
 
-async def _try_popup_url(context: BrowserContext, popup_url: str, order_number: str = None):
+async def _try_popup_url(
+    context: BrowserContext,
+    popup_url: str,
+    order_number: str = None,
+    query_485_string: str | None = None,
+):
     """Try to fetch the actual PDF from the document viewer endpoint."""
     
     import re
@@ -518,6 +630,15 @@ async def _try_popup_url(context: BrowserContext, popup_url: str, order_number: 
             f"https://www.kantimehealth.net/HH/Z1/UI/Common/DownloadDocument.ashx?Reference={reference}&documentId={doc_id}",
             popup_url,
         ]
+
+        token = str(query_485_string or "").strip()
+        if token:
+            tokenized = []
+            for u in pdf_endpoints:
+                sep = "&" if "?" in u else "?"
+                tokenized.append(f"{u}{sep}_485QueryString={token}")
+                tokenized.append(f"{u}{sep}q={token}")
+            pdf_endpoints.extend(tokenized)
         
         for pdf_url in pdf_endpoints:
             console.log(f"  [dim]S3: Trying {pdf_url[-40:]}[/dim]")
@@ -534,6 +655,93 @@ async def _try_popup_url(context: BrowserContext, popup_url: str, order_number: 
             if raw:
                 console.log("  [dim]S3: response was not a PDF (missing %PDF header)[/dim]")
     
+    return None
+
+
+async def _try_popup_probe_src(context: BrowserContext, popup_url: str, order_number: str = None):
+    """
+    Retry-only fallback: open popup page and fetch the rendered document src directly.
+    This avoids Cmd+S and keeps recovery fast for endpoints that require viewer initialization.
+    """
+    popup = await context.new_page()
+    try:
+        await popup.goto(popup_url, wait_until="networkidle", timeout=20_000)
+        console.log("  [dim]S3c: Popup probe for document src[/dim]")
+        return await _try_fetch_doc_src(context, popup, order_number)
+    finally:
+        await popup.close()
+
+
+async def _try_document_path_url(
+    context: BrowserContext,
+    popup_url: str,
+    document_path: str,
+    order_number: str = None,
+    query_485_string: str | None = None,
+):
+    path = str(document_path or "").strip()
+    if not path:
+        return None
+
+    parsed_popup = urlparse(popup_url)
+    origin = f"{parsed_popup.scheme}://{parsed_popup.netloc}" if parsed_popup.scheme and parsed_popup.netloc else ""
+
+    candidates = []
+    seen = set()
+
+    def _add(url: str):
+        if not url or url in seen:
+            return
+        seen.add(url)
+        candidates.append(url)
+
+    def _add_tokenized(url: str):
+        _add(url)
+        token = str(query_485_string or "").strip()
+        if not token:
+            return
+        sep = "&" if "?" in url else "?"
+        _add(f"{url}{sep}_485QueryString={token}")
+        _add(f"{url}{sep}q={token}")
+
+    normalized = path.lstrip("/")
+    normalized_encoded = normalized.replace("$", "%24")
+
+    # Try raw/encoded absolute path on origin.
+    if path.startswith("http://") or path.startswith("https://"):
+        _add_tokenized(path)
+    elif origin:
+        _add_tokenized(f"{origin}/{normalized}")
+        _add_tokenized(f"{origin}/{normalized_encoded}")
+
+        # Try app-root prefix inferred from popup URL (e.g. /HH/Z1).
+        parts = [p for p in parsed_popup.path.split("/") if p]
+        if len(parts) >= 2:
+            app_root = "/" + "/".join(parts[:2])
+            _add_tokenized(f"{origin}{app_root}/{normalized}")
+            _add_tokenized(f"{origin}{app_root}/{normalized_encoded}")
+
+    # Try configured base URL variants.
+    base = str(settings.BASE_URL or "").rstrip("/")
+    if base:
+        _add_tokenized(f"{base}/{normalized}")
+        _add_tokenized(f"{base}/{normalized_encoded}")
+
+    for candidate in candidates:
+        console.log(f"  [dim]S3b: Trying document_path URL {candidate[-60:]}[/dim]")
+        raw = await _fetch_authenticated(context, candidate, timeout=5_000)
+        if raw and raw.startswith(b"%PDF"):
+            pdf_dir = Path(settings.PDF_DIR)
+            pdf_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"{order_number or 'doc'}.pdf"
+            filepath = pdf_dir / filename
+            filepath.write_bytes(raw)
+            console.log(f"  [green]✓ S3b: Downloaded PDF {len(raw):,} bytes ({filename})[/green]")
+            return {"document_file_path": str(filepath)}
+
+        if raw:
+            console.log("  [dim]S3b: response was not a PDF (missing %PDF header)[/dim]")
+
     return None
 
 
