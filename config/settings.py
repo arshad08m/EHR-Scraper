@@ -48,12 +48,14 @@ class Settings:
     LOGS_DIR:        Path = Path("logs")
     PDF_DIR:         Path = Path("data/pdfs")
     CHECKPOINT_FILE: Path = Path("data/checkpoint.json")
+    JSON_OUTPUT:     Path = Path("data/orders_output.json")
     JSONL_OUTPUT:    Path = Path("data/orders_output.jsonl")
 
     # ── Scraper behaviour ─────────────────────────────────────────────────────
     REQUEST_DELAY: float = float(os.getenv("REQUEST_DELAY_SECONDS", "1.5"))
     MAX_RETRIES:   int   = int(os.getenv("MAX_RETRIES",             "3"))
     MAX_DOCS:      int   = int(os.getenv("MAX_DOCS",                "0"))  # 0 = unlimited, >0 = test mode
+    PAGE_SIZE:     int   = _env_int("PAGE_SIZE",                    "100")
     ENABLE_DATA_EXTRACTION: bool = _env_bool("ENABLE_DATA_EXTRACTION", "false")
 
     # ── Ollama Vision extraction ─────────────────────────────────────────────

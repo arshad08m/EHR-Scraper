@@ -64,19 +64,118 @@ def update_progress(month: str, page: int, total_pages: int, rows_saved: int):
         "last_page":   page,
         "total_pages": total_pages,
         "rows_saved":  rows_saved,
+        "active_page": None,
+        "processed_row_uids": [],
+        "processed_rows_in_active_page": 0,
         "updated_at":  datetime.now(timezone.utc).isoformat(),
     }
     _save(data)
 
 
-def get_resume_page(month: str) -> int:
+def update_partial_progress(
+    month: str,
+    active_page: int,
+    total_pages: int,
+    rows_saved: int,
+    processed_row_uids: list[str],
+):
+    """
+    Save row-level progress for a partially processed page.
+    """
     data = _load()
-    ip   = data.get("in_progress")
-    if ip and ip.get("month") == month:
-        page = ip.get("last_page", 1)
-        console.log(f"[yellow]↩ Resuming {month} from page {page}[/yellow]")
-        return page
-    return 1
+    unique_uids = list(dict.fromkeys(processed_row_uids or []))
+    data["in_progress"] = {
+        "month":       month,
+        "last_page":   max(0, active_page - 1),
+        "active_page": active_page,
+        "processed_row_uids": unique_uids,
+        "processed_rows_in_active_page": len(unique_uids),
+        "total_pages": total_pages,
+        "rows_saved":  rows_saved,
+        "updated_at":  datetime.now(timezone.utc).isoformat(),
+    }
+    _save(data)
+
+
+def get_resume_state(month: str) -> dict:
+    """
+    Return resume page and any row-level progress on that page.
+    """
+    data = _load()
+    ip = data.get("in_progress")
+    if not ip or ip.get("month") != month:
+        return {
+            "page": 1,
+            "rows_saved": 0,
+            "active_page": None,
+            "processed_row_uids": [],
+            "total_pages": 0,
+        }
+
+    last_page = int(ip.get("last_page", 0) or 0)
+    total_pages = int(ip.get("total_pages", 0) or 0)
+    rows_saved = int(ip.get("rows_saved", 0) or 0)
+    active_page = int(ip.get("active_page", 0) or 0)
+    processed_row_uids = ip.get("processed_row_uids") or []
+    if not isinstance(processed_row_uids, list):
+        processed_row_uids = []
+
+    if last_page < 0:
+        console.log(f"[yellow]↩ Invalid checkpoint page ({last_page}); restarting {month} from page 1[/yellow]")
+        return {
+            "page": 1,
+            "rows_saved": rows_saved,
+            "active_page": None,
+            "processed_row_uids": [],
+            "total_pages": total_pages,
+        }
+
+    if total_pages > 0 and last_page > total_pages:
+        console.log(
+            f"[yellow]↩ Invalid checkpoint range ({last_page}>{total_pages}); restarting {month} from page 1[/yellow]"
+        )
+        return {
+            "page": 1,
+            "rows_saved": rows_saved,
+            "active_page": None,
+            "processed_row_uids": [],
+            "total_pages": total_pages,
+        }
+
+    if active_page > 0:
+        if total_pages > 0 and active_page > total_pages:
+            console.log(
+                f"[yellow]↩ Invalid active page ({active_page}>{total_pages}); resuming from page {max(1, last_page + 1)}[/yellow]"
+            )
+        else:
+            console.log(
+                f"[yellow]↩ Resuming {month} from page {active_page} "
+                f"(partial: {len(processed_row_uids)} rows already done)[/yellow]"
+            )
+            return {
+                "page": active_page,
+                "rows_saved": rows_saved,
+                "active_page": active_page,
+                "processed_row_uids": processed_row_uids,
+                "total_pages": total_pages,
+            }
+
+    next_page = max(1, last_page + 1)
+    if total_pages > 0:
+        next_page = min(next_page, total_pages)
+
+    console.log(f"[yellow]↩ Resuming {month} from page {next_page}[/yellow]")
+    return {
+        "page": next_page,
+        "rows_saved": rows_saved,
+        "active_page": None,
+        "processed_row_uids": [],
+        "total_pages": total_pages,
+    }
+
+
+def get_resume_page(month: str) -> int:
+    return int(get_resume_state(month).get("page", 1) or 1)
 
 
 def mark_order_failed(order_number: str):

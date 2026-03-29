@@ -145,6 +145,23 @@ async def capture_document(context: BrowserContext, view_btn_locator, order_numb
     return {**doc_result, **meta_result}
 
 
+async def capture_document_from_url(context: BrowserContext, popup_url: str, order_number: str = None) -> dict:
+    """
+    Capture a document when we already know the popup URL (GetData fallback path).
+    """
+    popup = await context.new_page()
+    try:
+        await popup.goto(popup_url, wait_until="networkidle", timeout=20_000)
+        resolved_url = popup.url
+        console.log(f"  [dim]Popup URL: {resolved_url}[/dim]")
+
+        doc_result = await _capture_with_fallbacks(context, popup, resolved_url, order_number)
+        meta_result = await _extract_metadata_by_flag(popup, doc_result.get("document_file_path"))
+        return {**doc_result, **meta_result}
+    finally:
+        await popup.close()
+
+
 async def _extract_metadata_by_flag(popup: Page, document_file_path: str | None = None) -> dict:
     """
     Feature-flag entrypoint for metadata extraction.

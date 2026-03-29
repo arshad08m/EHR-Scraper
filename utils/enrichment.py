@@ -2,12 +2,9 @@
 utils/enrichment.py — joins scraped orders with the master Excel file
 (patients + physicians + NPIs) built earlier.
 
-Usage (standalone):
-    python -m utils.enrichment --orders data/orders_output.jsonl \
-                               --master data/master_patients_physicians.xlsx \
-                               --output data/orders_enriched.jsonl
-
-Or call enrich_jsonl() directly after scraping completes.
+Supports both input formats:
+    - JSON array (data/orders_output.json)
+    - JSONL      (data/orders_output.jsonl)
 """
 
 import json
@@ -55,7 +52,8 @@ def enrich_jsonl(
     npi_col:       str = "npi",
 ):
     """
-    Read JSONL orders, join with master Excel, write enriched JSONL.
+    Read orders (JSON array or JSONL), join with master Excel,
+    write enriched output as JSON (if output suffix is .json) or JSONL.
     Missing joins are flagged rather than dropped.
     """
     orders_path = Path(orders_path)
@@ -77,41 +75,64 @@ def enrich_jsonl(
         if row.get(physician_key)
     }
 
-    enriched_count = unmatched_pat = unmatched_phy = 0
+    records: list[dict] = []
+    if orders_path.suffix.lower() == ".json":
+        with open(orders_path, encoding="utf-8") as fin:
+            raw = json.load(fin)
+        if isinstance(raw, list):
+            records = [r for r in raw if isinstance(r, dict)]
+    else:
+        with open(orders_path, encoding="utf-8") as fin:
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    if isinstance(row, dict):
+                        records.append(row)
+                except Exception:
+                    continue
 
-    with open(orders_path) as fin, open(output_path, "w") as fout:
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
+    enriched_rows: list[dict] = []
+    unmatched_pat = unmatched_phy = 0
 
-            # Join patient
-            key = _norm(record.get("client_name", ""))
-            pat = pat_lookup.get(key)
-            if pat:
-                record["patient_id"]  = pat.get(patient_key, "")
-                record["patient_dob"] = pat.get("date_of_birth", "")
-                record["patient_match"] = True
-            else:
-                record["patient_id"]    = None
-                record["patient_match"] = False
-                unmatched_pat += 1
+    for record in records:
+        # Join patient
+        key = _norm(record.get("client_name", ""))
+        pat = pat_lookup.get(key)
+        if pat:
+            record["patient_id"]  = pat.get(patient_key, "")
+            record["patient_dob"] = pat.get("date_of_birth", "")
+            record["patient_match"] = True
+        else:
+            record["patient_id"]    = None
+            record["patient_match"] = False
+            unmatched_pat += 1
 
-            # Join physician via patient → physician mapping
-            phy_id = str(pat.get(physician_key, "") if pat else "").strip()
-            phy    = phy_lookup.get(phy_id)
-            if phy:
-                record["physician_npi"]   = phy.get(npi_col, "")
-                record["physician_name"]  = phy.get("physician_name", "")
-                record["physician_match"] = True
-            else:
-                record["physician_npi"]   = None
-                record["physician_match"] = False
-                unmatched_phy += 1
+        # Join physician via patient -> physician mapping
+        phy_id = str(pat.get(physician_key, "") if pat else "").strip()
+        phy    = phy_lookup.get(phy_id)
+        if phy:
+            record["physician_npi"]   = phy.get(npi_col, "")
+            record["physician_name"]  = phy.get("physician_name", "")
+            record["physician_match"] = True
+        else:
+            record["physician_npi"]   = None
+            record["physician_match"] = False
+            unmatched_phy += 1
 
-            fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-            enriched_count += 1
+        enriched_rows.append(record)
+
+    if output_path.suffix.lower() == ".json":
+        with open(output_path, "w", encoding="utf-8") as fout:
+            json.dump(enriched_rows, fout, ensure_ascii=False, indent=2)
+    else:
+        with open(output_path, "w", encoding="utf-8") as fout:
+            for row in enriched_rows:
+                fout.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    enriched_count = len(enriched_rows)
 
     console.log(f"[green]✓ Enriched {enriched_count} records → {output_path}[/green]")
     console.log(f"  Unmatched patients   : {unmatched_pat}")
@@ -120,8 +141,8 @@ def enrich_jsonl(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--orders",  required=True, help="Path to orders_output.jsonl")
+    parser.add_argument("--orders",  required=True, help="Path to orders output (.json or .jsonl)")
     parser.add_argument("--master",  required=True, help="Path to master Excel file")
-    parser.add_argument("--output",  default="data/orders_enriched.jsonl")
+    parser.add_argument("--output",  default="data/orders_enriched.json")
     args = parser.parse_args()
     enrich_jsonl(args.orders, args.master, args.output)

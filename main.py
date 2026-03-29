@@ -58,7 +58,7 @@ async def main():
     console.rule("[bold cyan]Kantime WorldView Document Scraper[/bold cyan]")
     console.print(f"Months : {[f'{y}-{mo:02d}' for y, mo in months]}")
     console.print(f"Browser: {'headless' if args.headless else 'visible'}")
-    console.print(f"Storage: {'MongoDB Atlas' if settings.MONGO_URI else 'Local JSONL (data/orders_output.jsonl)'}")
+    console.print(f"Storage: {'MongoDB Atlas' if settings.MONGO_URI else 'Local JSON (data/orders_output.json)'}")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(

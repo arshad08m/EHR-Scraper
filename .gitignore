@@ -13,9 +13,11 @@ dist/
 build/
 
 # Data outputs (large files)
+data/orders_output.json
 data/orders_output.jsonl
 data/orders_enriched.jsonl
 data/checkpoint.json
+/scripts/
 
 # Logs
 logs/
