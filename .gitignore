@@ -1,0 +1,28 @@
+# Environment and secrets — NEVER commit these
+config/.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Data outputs (large files)
+data/orders_output.jsonl
+data/orders_enriched.jsonl
+data/checkpoint.json
+
+# Logs
+logs/
+*.log
+
+# macOS
+.DS_Store
+
+# Playwright
+playwright/.local-browsers/
