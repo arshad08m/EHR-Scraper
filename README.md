@@ -2,7 +2,7 @@
 
 Scrapes order metadata and clinical documents from Kantime's WorldView UI,
 stores each captured document as a file under data/pdfs, extracts structured metadata from each popup,
-and stores everything in MongoDB Atlas or local JSONL.
+and stores everything in MongoDB Atlas or local JSON with canonical per-document uniqueness.
 
 ---
 
@@ -28,13 +28,13 @@ kantime_scraper/
 │
 ├── utils/
 │   ├── checkpoint.py          ← Page-level resume on any crash
-│   ├── storage.py             ← JSONL now, MongoDB with one .env change
+│   ├── storage.py             ← Canonical storage_uid upsert (local JSON + MongoDB)
 │   └── enrichment.py         ← Join orders with master Excel (patients + NPIs)
 │
 ├── data/                      ← Auto-created at runtime (git-ignored)
-│   ├── orders_output.jsonl    ← Output records with document_file_path
+│   ├── orders_output.json     ← Output records with document_file_path
 │   ├── checkpoint.json        ← Resume state + failed orders
-│   └── pdfs/                  ← Saved PDFs/screenshots per order
+│   └── pdfs/                  ← Saved PDFs/screenshots per document identity
 ├── logs/                      ← Auto-created at runtime (git-ignored)
 └── docs/
     └── MASTER_PROMPT.md       ← Paste into new Claude sessions to restore context
@@ -119,7 +119,7 @@ When "View" is clicked on any order row:
 - Primary attempt is **Cmd+S** (Mac save shortcut) to save PDF
 - If no new PDF appears, fallback sequence is used:
   S2 fetch rendered doc src → S3 fetch direct document endpoint → S4 screenshot
-- Saved files are written to **data/pdfs/** with order-based names
+- Saved files are written to **data/pdfs/** with client-document-led names (for example `cdoc-123456.pdf`)
 
 ---
 
@@ -136,8 +136,9 @@ When "View" is clicked on any order row:
   "reviewed":                     "Yes",
   "doc_type":                     "client_document",
   "date_batch":                   "2026-01",
+  "storage_uid":                  "cdoc:123456",
 
-  "document_file_path":           "data/pdfs/P-24076.pdf",
+  "document_file_path":           "data/pdfs/cdoc-123456.pdf",
   "document_url":                 "https://...",
 
   "mrn_from_doc":                 "8981",
@@ -167,12 +168,17 @@ When "View" is clicked on any order row:
 # Add to config/.env:
 MONGO_CONNECTION_STRING=mongodb+srv://<user>:<pass>@<cluster>.mongodb.net/
 
-# No other changes needed — storage.py auto-switches.
+# No other changes needed — storage.py auto-switches and uses canonical `storage_uid` upserts.
 
-# Import existing JSONL:
+# Import existing JSON output:
 mongoimport --uri "$MONGO_CONNECTION_STRING" \
   --db kantime_ehr --collection orders \
-  --file data/orders_output.jsonl
+  --jsonArray --file data/orders_output.json
+
+# Legacy JSONL import (older runs):
+# mongoimport --uri "$MONGO_CONNECTION_STRING" \
+#   --db kantime_ehr --collection orders \
+#   --file data/orders_output.jsonl
 ```
 
 ---
@@ -181,9 +187,9 @@ mongoimport --uri "$MONGO_CONNECTION_STRING" \
 
 ```bash
 python3 -m utils.enrichment \
-  --orders data/orders_output.jsonl \
+  --orders data/orders_output.json \
   --master /path/to/master_patients_physicians.xlsx \
-  --output data/orders_enriched.jsonl
+  --output data/orders_enriched.json
 ```
 
 ---

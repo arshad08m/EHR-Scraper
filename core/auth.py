@@ -103,14 +103,56 @@ def _is_auth_page_url(url: str) -> bool:
 
 
 async def _looks_like_login_form(page: Page) -> bool:
-    # Some tenants route to auth URLs that do not contain Login.aspx.
-    # A password field on the root page is a reliable signal that auth is required.
-    selectors = [
-        "input[type='password']",
-        "input[name*='password' i]",
+    """
+    Heuristic for auth-required pages when URL markers are inconclusive.
+    Avoid false positives on WorldView pages that contain embedded password fields.
+    """
+    url = (page.url or "").lower()
+    if "worldview_receiveddocuments.aspx" in url or "dashboardmaster.aspx" in url:
+        return False
+
+    has_password = await _has_any(page, [
         "#txtPassword",
         "#Password",
-    ]
+        "input[autocomplete='current-password']",
+        "input[name*='password' i]",
+        "input[type='password']",
+    ])
+    if not has_password:
+        return False
+
+    has_username = await _has_any(page, [
+        "#txtUserName",
+        "#UserName",
+        "input[autocomplete='username']",
+        "input[name*='username' i]",
+        "input[name*='user' i]",
+        "input[name*='email' i]",
+    ])
+    if not has_username:
+        return False
+
+    # Require login-specific submit controls; generic submit buttons exist on WorldView pages.
+    has_login_submit = await _has_any(page, [
+        "#btnLogin",
+        "#LoginButton",
+        "input[value*='login' i]",
+        "button:has-text('Login')",
+        "button:has-text('Sign in')",
+    ])
+    if not has_login_submit:
+        return False
+
+    # If key WorldView controls are present, do not classify as login page.
+    on_worldview_ui = await _has_any(page, [
+        "#MainContent_btn_display",
+        "#RecordsCount",
+        "#tableData",
+    ])
+    return not on_worldview_ui
+
+
+async def _has_any(page: Page, selectors: list[str]) -> bool:
     for sel in selectors:
         try:
             if await page.locator(sel).count() > 0:

@@ -11,7 +11,7 @@ Checkpoint file (data/checkpoint.json) structure:
     "rows_saved":  387,
     "updated_at":  "2026-03-28T10:00:00"
   },
-  "failed_orders": ["P-24076", "C-25963"]
+    "failed_orders": ["uid:cdoc:123456", "P-24076"]
 }
 """
 

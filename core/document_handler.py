@@ -126,7 +126,7 @@ _MIME_MAP = {
     stop=stop_after_attempt(1),  # No retries - S2/S3/S4 fallbacks are fast enough
     wait=wait_exponential(multiplier=0.5, min=1, max=3),
 )
-async def capture_document(context: BrowserContext, view_btn_locator, order_number: str = None) -> dict:
+async def capture_document(context: BrowserContext, view_btn_locator, file_id: str = None) -> dict:
     """
     Click the View button, wait for the new popup window, capture PDF to disk.
     Returns dict with document_file_path (not Base64) + metadata extracted from popup.
@@ -139,14 +139,14 @@ async def capture_document(context: BrowserContext, view_btn_locator, order_numb
     popup_url = popup.url
     console.log(f"  [dim]Popup: {popup_url}[/dim]")
 
-    doc_result  = await _capture_with_fallbacks(context, popup, popup_url, order_number)
+    doc_result  = await _capture_with_fallbacks(context, popup, popup_url, file_id)
     meta_result = await _extract_metadata_by_flag(popup, doc_result.get("document_file_path"))
 
     await popup.close()
     return {**doc_result, **meta_result}
 
 
-async def capture_document_from_url(context: BrowserContext, popup_url: str, order_number: str = None) -> dict:
+async def capture_document_from_url(context: BrowserContext, popup_url: str, file_id: str = None) -> dict:
     """
     Capture a document when we already know the popup URL (GetData fallback path).
     """
@@ -156,7 +156,7 @@ async def capture_document_from_url(context: BrowserContext, popup_url: str, ord
         resolved_url = popup.url
         console.log(f"  [dim]Popup URL: {resolved_url}[/dim]")
 
-        doc_result = await _capture_with_fallbacks(context, popup, resolved_url, order_number)
+        doc_result = await _capture_with_fallbacks(context, popup, resolved_url, file_id)
         meta_result = await _extract_metadata_by_flag(popup, doc_result.get("document_file_path"))
         return {**doc_result, **meta_result}
     finally:
@@ -166,7 +166,7 @@ async def capture_document_from_url(context: BrowserContext, popup_url: str, ord
 async def capture_document_direct_from_url(
     context: BrowserContext,
     popup_url: str,
-    order_number: str = None,
+    file_id: str = None,
     document_path: str | None = None,
     query_485_string: str | None = None,
     enable_popup_probe: bool = False,
@@ -180,7 +180,7 @@ async def capture_document_direct_from_url(
         doc_result = await _try_popup_url(
             context,
             popup_url,
-            order_number,
+            file_id,
             query_485_string=query_485_string,
         )
     except Exception as e:
@@ -193,7 +193,7 @@ async def capture_document_direct_from_url(
                 context,
                 popup_url,
                 document_path,
-                order_number,
+                file_id,
                 query_485_string=query_485_string,
             )
         except Exception as e:
@@ -202,7 +202,7 @@ async def capture_document_direct_from_url(
 
     if not doc_result and enable_popup_probe:
         try:
-            doc_result = await _try_popup_probe_src(context, popup_url, order_number)
+            doc_result = await _try_popup_probe_src(context, popup_url, file_id)
         except Exception as e:
             console.log(f"  [dim]Direct popup-probe error: {type(e).__name__}[/dim]")
             doc_result = None
@@ -442,7 +442,7 @@ def _drop_empty_metadata_values(meta: dict) -> dict:
 
 # ── Strategy 1: Use Cmd+S on Mac to save PDF ─────────────────────────────────
 
-async def _try_download_button(context: BrowserContext, popup: Page, order_number: str = None):
+async def _try_download_button(context: BrowserContext, popup: Page, file_id: str = None):
     """
     Press Cmd+S on Mac to trigger PDF download via save dialog.
     Saves to data/pdfs/ and returns file path.
@@ -486,9 +486,9 @@ async def _try_download_button(context: BrowserContext, popup: Page, order_numbe
             if changed_files:
                 latest_pdf = max(changed_files, key=lambda t: t[0])[1]
 
-                if order_number:
-                    safe_order = re.sub(r"[^A-Za-z0-9_.-]", "_", order_number)
-                    dest_path = pdf_dir / f"{safe_order}.pdf"
+                if file_id:
+                    safe_file_id = re.sub(r"[^A-Za-z0-9_.-]", "_", file_id)
+                    dest_path = pdf_dir / f"{safe_file_id}.pdf"
                     # Copy bytes so source download file can be reused by the viewer.
                     dest_path.write_bytes(latest_pdf.read_bytes())
                     console.log(f"  [green]✓ S1: Saved PDF ({dest_path.name})[/green]")
@@ -513,7 +513,7 @@ async def _find_last_toolbar_button(popup: Page):
 
 # ── Strategy 2: fetch rendered document img/embed src ────────────────────────
 
-async def _try_fetch_doc_src(context: BrowserContext, popup: Page, order_number: str = None):
+async def _try_fetch_doc_src(context: BrowserContext, popup: Page, file_id: str = None):
     try:
         src = await popup.evaluate(
             """
@@ -575,7 +575,7 @@ async def _try_fetch_doc_src(context: BrowserContext, popup: Page, order_number:
             if raw_candidate and raw_candidate.startswith(b"%PDF"):
                 pdf_dir = Path(settings.PDF_DIR)
                 pdf_dir.mkdir(parents=True, exist_ok=True)
-                filename = f"{order_number or 'doc'}.pdf"
+                filename = f"{file_id or 'doc'}.pdf"
                 filepath = pdf_dir / filename
                 filepath.write_bytes(raw_candidate)
                 console.log(f"  [green]✓ S2: Downloaded PDF {len(raw_candidate):,} bytes ({filename})[/green]")
@@ -597,7 +597,7 @@ async def _try_fetch_doc_src(context: BrowserContext, popup: Page, order_number:
         pdf_dir = Path(settings.PDF_DIR)
         pdf_dir.mkdir(parents=True, exist_ok=True)
         ext = _get_ext_from_mime(_guess_mime(resolved))
-        filename = f"{order_number or 'doc'}{ext}"
+        filename = f"{file_id or 'doc'}{ext}"
         filepath = pdf_dir / filename
         filepath.write_bytes(raw)
         console.log(f"  [green]✓ S2: Saved {len(raw):,} bytes ({filename})[/green]")
@@ -610,7 +610,7 @@ async def _try_fetch_doc_src(context: BrowserContext, popup: Page, order_number:
 async def _try_popup_url(
     context: BrowserContext,
     popup_url: str,
-    order_number: str = None,
+    file_id: str = None,
     query_485_string: str | None = None,
 ):
     """Try to fetch the actual PDF from the document viewer endpoint."""
@@ -647,7 +647,7 @@ async def _try_popup_url(
                 # Save to file
                 pdf_dir = Path(settings.PDF_DIR)
                 pdf_dir.mkdir(parents=True, exist_ok=True)
-                filename = f"{order_number or 'doc'}.pdf"
+                filename = f"{file_id or 'doc'}.pdf"
                 filepath = pdf_dir / filename
                 filepath.write_bytes(raw)
                 console.log(f"  [green]✓ S3: Downloaded PDF {len(raw):,} bytes ({filename})[/green]")
@@ -658,7 +658,7 @@ async def _try_popup_url(
     return None
 
 
-async def _try_popup_probe_src(context: BrowserContext, popup_url: str, order_number: str = None):
+async def _try_popup_probe_src(context: BrowserContext, popup_url: str, file_id: str = None):
     """
     Retry-only fallback: open popup page and fetch the rendered document src directly.
     This avoids Cmd+S and keeps recovery fast for endpoints that require viewer initialization.
@@ -667,7 +667,7 @@ async def _try_popup_probe_src(context: BrowserContext, popup_url: str, order_nu
     try:
         await popup.goto(popup_url, wait_until="networkidle", timeout=20_000)
         console.log("  [dim]S3c: Popup probe for document src[/dim]")
-        return await _try_fetch_doc_src(context, popup, order_number)
+        return await _try_fetch_doc_src(context, popup, file_id)
     finally:
         await popup.close()
 
@@ -676,7 +676,7 @@ async def _try_document_path_url(
     context: BrowserContext,
     popup_url: str,
     document_path: str,
-    order_number: str = None,
+    file_id: str = None,
     query_485_string: str | None = None,
 ):
     path = str(document_path or "").strip()
@@ -733,7 +733,7 @@ async def _try_document_path_url(
         if raw and raw.startswith(b"%PDF"):
             pdf_dir = Path(settings.PDF_DIR)
             pdf_dir.mkdir(parents=True, exist_ok=True)
-            filename = f"{order_number or 'doc'}.pdf"
+            filename = f"{file_id or 'doc'}.pdf"
             filepath = pdf_dir / filename
             filepath.write_bytes(raw)
             console.log(f"  [green]✓ S3b: Downloaded PDF {len(raw):,} bytes ({filename})[/green]")
@@ -747,14 +747,14 @@ async def _try_document_path_url(
 
 # ── Strategy 4: screenshot fallback ──────────────────────────────────────────
 
-async def _screenshot_fallback(popup: Page, order_number: str = None):
+async def _screenshot_fallback(popup: Page, file_id: str = None):
     console.log("  [yellow]S4: Taking screenshot fallback[/yellow]")
     try:
         raw = await popup.screenshot(full_page=True, type="png", timeout=5_000)
         # Save screenshot to file
         pdf_dir = Path(settings.PDF_DIR)
         pdf_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{order_number or 'doc'}_screenshot.png"
+        filename = f"{file_id or 'doc'}_screenshot.png"
         filepath = pdf_dir / filename
         filepath.write_bytes(raw)
         console.log(f"  [green]✓ S4: Saved screenshot ({filename})[/green]")
@@ -766,16 +766,16 @@ async def _screenshot_fallback(popup: Page, order_number: str = None):
 
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
-async def _capture_with_fallbacks(context: BrowserContext, popup: Page, popup_url: str, order_number: str = None) -> dict:
+async def _capture_with_fallbacks(context: BrowserContext, popup: Page, popup_url: str, file_id: str = None) -> dict:
     result = None
 
-    r = await _try_download_button(context, popup, order_number)
+    r = await _try_download_button(context, popup, file_id)
     if r:
         result = r
     
     if not result:
         try:
-            r = await _try_fetch_doc_src(context, popup, order_number)
+            r = await _try_fetch_doc_src(context, popup, file_id)
             if r:
                 result = r
         except Exception as e:
@@ -783,7 +783,7 @@ async def _capture_with_fallbacks(context: BrowserContext, popup: Page, popup_ur
     
     if not result:
         try:
-            r = await _try_popup_url(context, popup_url, order_number)
+            r = await _try_popup_url(context, popup_url, file_id)
             if r:
                 result = r
         except Exception as e:
@@ -792,7 +792,7 @@ async def _capture_with_fallbacks(context: BrowserContext, popup: Page, popup_ur
     if not result:
         console.log("  [yellow]S1-S3 all failed, using S4: screenshot[/yellow]")
         try:
-            result = await _screenshot_fallback(popup, order_number)
+            result = await _screenshot_fallback(popup, file_id)
         except Exception as e:
             console.log(f"  [red]S4 ALSO failed: {type(e).__name__}[/red]")
             result = None

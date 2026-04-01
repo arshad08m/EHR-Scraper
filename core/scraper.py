@@ -146,7 +146,10 @@ async def scrape_month(context: BrowserContext, year: int, month: int):
             rows_to_process = rows
             if page_num == resume_from and resume_active_page == page_num and resume_processed_row_uids:
                 page_processed_uids = set(resume_processed_row_uids)
-                rows_to_process = [r for r in rows if _row_uid(r) not in page_processed_uids]
+                rows_to_process = [
+                    r for r in rows
+                    if not any(uid in page_processed_uids for uid in _row_uid_aliases(r))
+                ]
                 skipped = len(rows) - len(rows_to_process)
                 if skipped > 0:
                     console.log(
@@ -174,10 +177,11 @@ async def scrape_month(context: BrowserContext, year: int, month: int):
                 tasks = []
                 for offset, row in enumerate(batch_rows):
                     idx = batch_start + offset
-                    order_num = str(row.get("order_number") or "").strip()
-                    if not order_num:
-                        order_num = f"row_{page_num}_{idx + 1}"
-                    console.log(f"    [{idx+1}/{total_to_process}] {order_num}")
+                    order_label = str(row.get("order_number") or "").strip()
+                    if not order_label:
+                        order_label = f"row_{page_num}_{idx + 1}"
+                    file_id = _file_id(row, page_num=page_num, row_idx=idx)
+                    console.log(f"    [{idx+1}/{total_to_process}] {order_label}")
                     tasks.append(
                         _capture_row_with_semaphore(
                             semaphore,
@@ -185,19 +189,20 @@ async def scrape_month(context: BrowserContext, year: int, month: int):
                             page,
                             row,
                             idx,
-                            order_num,
+                            order_label,
+                            file_id,
                             month_key,
                         )
                     )
 
                 batch_results = await asyncio.gather(*tasks, return_exceptions=False)
-                for result_row, order_num, err in batch_results:
+                for result_row, order_label, failed_key, err in batch_results:
                     if err:
-                        console.log(f"    [red]Doc capture failed ({order_num}): {err}[/red]")
+                        console.log(f"    [red]Doc capture failed ({order_label}): {err}[/red]")
                         result_row["document_file_path"] = None
 
                     if err or not result_row.get("document_file_path"):
-                        mark_order_failed(order_num)
+                        mark_order_failed(failed_key)
 
                     enriched.append(result_row)
                     page_processed_uids.add(_row_uid(result_row))
@@ -277,18 +282,19 @@ async def retry_failed_orders(
         console.log("[yellow]No local output records found for failed-order retry.[/yellow]")
         return {"attempted": 0, "recovered": 0, "remaining": len(failed)}
 
-    failed_set = set(failed)
+    failed_set = {str(v).strip() for v in failed if str(v).strip()}
     candidates = []
     for record in records:
         if not isinstance(record, dict):
             continue
-        order_num = str(record.get("order_number") or "").strip()
-        if not order_num or order_num not in failed_set:
+        retry_keys = _retry_keys_for_record(record)
+        matched_keys = sorted(retry_keys & failed_set)
+        if not matched_keys:
             continue
         batch = str(record.get("date_batch") or "").strip()
         if month_keys and batch not in month_keys:
             continue
-        candidates.append(record)
+        candidates.append((record, matched_keys))
 
     if not candidates:
         console.log("[yellow]No matching failed records found in local output for selected scope.[/yellow]")
@@ -296,19 +302,26 @@ async def retry_failed_orders(
 
     recovered = 0
     attempted = 0
-    for record in candidates:
-        order_num = str(record.get("order_number") or "").strip()
+    recovered_keys: set[str] = set()
+    failed_again_keys: set[str] = set()
+
+    for record, matched_keys in candidates:
+        order_label = str(record.get("order_number") or "").strip()
+        if not order_label:
+            order_label = _clean_value(record.get("storage_uid")) or "unknown-order"
+        file_id = _file_id(record)
         popup_url = str(record.get("document_popup_url") or record.get("document_url") or "").strip()
         document_path = str(record.get("document_path") or "").strip()
         if not popup_url:
+            failed_again_keys.update(matched_keys)
             continue
 
         attempted += 1
-        console.log(f"[cyan]Retry failed order {order_num} ({attempted}/{len(candidates)})[/cyan]")
+        console.log(f"[cyan]Retry failed order {order_label} ({attempted}/{len(candidates)})[/cyan]")
         doc_result = await capture_document_direct_from_url(
             context,
             popup_url,
-            order_num,
+            file_id,
             document_path=document_path,
             query_485_string=record.get("query_485_string"),
             enable_popup_probe=True,
@@ -316,9 +329,9 @@ async def retry_failed_orders(
         file_path = doc_result.get("document_file_path")
         if not file_path:
             await _ensure_retry_session(context)
-            console.log(f"[dim]Retry fallback: opening popup capture for {order_num}[/dim]")
+            console.log(f"[dim]Retry fallback: opening popup capture for {order_label}[/dim]")
             try:
-                popup_result = await capture_document_from_url(context, popup_url, order_num)
+                popup_result = await capture_document_from_url(context, popup_url, file_id)
                 if popup_result and popup_result.get("document_file_path"):
                     doc_result = popup_result
                     file_path = popup_result.get("document_file_path")
@@ -327,12 +340,18 @@ async def retry_failed_orders(
 
         if file_path:
             record.update(doc_result)
+            record["file_id"] = file_id
+            record["storage_uid"] = _storage_uid(record)
             save_batch([record])
-            clear_failed(order_num)
+            recovered_keys.update(matched_keys)
             recovered += 1
-            console.log(f"[green]Recovered failed order {order_num}[/green]")
+            console.log(f"[green]Recovered failed order {order_label}[/green]")
         else:
-            console.log(f"[yellow]Still failed after retry: {order_num}[/yellow]")
+            failed_again_keys.update(matched_keys)
+            console.log(f"[yellow]Still failed after retry: {order_label}[/yellow]")
+
+    for key in sorted(recovered_keys - failed_again_keys):
+        clear_failed(key)
 
     remaining = len(get_failed_orders())
     console.log(
@@ -686,7 +705,56 @@ def _derive_order_number(record: dict, client_doc_id: int, employee_doc_id: int)
     return ""
 
 
-def _row_uid(row: dict) -> str:
+def _fallback_row_digest(row: dict) -> str:
+    fingerprint = "|".join(
+        _clean_value(row.get(k)).lower()
+        for k in (
+            "source",
+            "client_name",
+            "location",
+            "received_date",
+            "received_time",
+            "status",
+            "reviewed",
+        )
+    )
+    return hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:20]
+
+
+def _storage_uid(row: dict) -> str:
+    client_doc_id = _to_int(row.get("client_document_id"), 0)
+    doc_reference_id = _to_int(row.get("doc_reference_id"), 0)
+    employee_doc_id = _to_int(row.get("employee_document_id"), 0)
+    worldview_id = _to_int(row.get("worldview_id"), 0)
+    order_id = _to_int(row.get("order_id"), 0)
+
+    if client_doc_id > 0:
+        return f"cdoc:{client_doc_id}"
+    if employee_doc_id > 0:
+        return f"edoc:{employee_doc_id}"
+    if doc_reference_id > 0 and order_id > 0:
+        return f"dref:{doc_reference_id}:oid:{order_id}"
+    if doc_reference_id > 0:
+        return f"dref:{doc_reference_id}"
+    if worldview_id > 0 and order_id > 0:
+        return f"wv:{worldview_id}:{order_id}"
+
+    order_number = _clean_value(row.get("order_number"))
+    received_date = _clean_value(row.get("received_date"))
+    client_name = _clean_value(row.get("client_name"))
+    if order_number and received_date:
+        return f"ord:{order_number}:{received_date}:{client_name.lower()}"
+    if order_number:
+        return f"ord:{order_number}"
+
+    row_dom_id = _clean_value(row.get("row_dom_id"))
+    if row_dom_id:
+        return f"dom:{row_dom_id}"
+
+    return f"row:{_fallback_row_digest(row)}"
+
+
+def _legacy_row_uid(row: dict) -> str:
     client_doc_id = _to_int(row.get("client_document_id"), 0)
     doc_reference_id = _to_int(row.get("doc_reference_id"), 0)
     employee_doc_id = _to_int(row.get("employee_document_id"), 0)
@@ -712,21 +780,56 @@ def _row_uid(row: dict) -> str:
     if row_dom_id:
         return f"dom:{row_dom_id}"
 
-    # Final fallback for malformed rows with no stable identifiers.
-    fingerprint = "|".join(
-        _clean_value(row.get(k)).lower()
-        for k in (
-            "source",
-            "client_name",
-            "location",
-            "received_date",
-            "received_time",
-            "status",
-            "reviewed",
-        )
-    )
-    digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:20]
-    return f"row:{digest}"
+    return f"row:{_fallback_row_digest(row)}"
+
+
+def _row_uid(row: dict) -> str:
+    return _storage_uid(row)
+
+
+def _row_uid_aliases(row: dict) -> set[str]:
+    """Return canonical + legacy UID forms for mixed-checkpoint resume compatibility."""
+    aliases = {_row_uid(row), _legacy_row_uid(row)}
+    return {uid for uid in aliases if uid}
+
+
+def _file_id(row: dict, page_num: int | None = None, row_idx: int | None = None) -> str:
+    client_doc_id = _to_int(row.get("client_document_id"), 0)
+    if client_doc_id > 0:
+        return f"cdoc-{client_doc_id}"
+
+    employee_doc_id = _to_int(row.get("employee_document_id"), 0)
+    if employee_doc_id > 0:
+        return f"edoc-{employee_doc_id}"
+
+    order_number = _clean_value(row.get("order_number"))
+    if order_number:
+        return order_number
+
+    row_dom_id = _clean_value(row.get("row_dom_id"))
+    if row_dom_id:
+        return f"dom-{row_dom_id}"
+
+    if page_num is not None and row_idx is not None:
+        return f"row_{page_num}_{row_idx + 1}"
+
+    return _storage_uid(row).replace(":", "-")
+
+
+def _failed_retry_key(row: dict) -> str:
+    return f"uid:{_storage_uid(row)}"
+
+
+def _retry_keys_for_record(record: dict) -> set[str]:
+    keys: set[str] = set()
+    storage_uid = _clean_value(record.get("storage_uid")) or _storage_uid(record)
+    if storage_uid:
+        keys.add(f"uid:{storage_uid}")
+
+    order_number = _clean_value(record.get("order_number"))
+    if order_number:
+        keys.add(order_number)
+    return keys
 
 
 def _map_getdata_record(record: dict, origin: str) -> dict:
@@ -865,7 +968,7 @@ async def _capture_document(
     page: Page,
     row: dict,
     row_idx: int,
-    order_number: str = None,
+    file_id: str = None,
 ) -> dict:
     popup_url = (row or {}).get("document_popup_url")
     if popup_url:
@@ -873,11 +976,11 @@ async def _capture_document(
             return await capture_document_direct_from_url(
                 context,
                 popup_url,
-                order_number,
+                file_id,
                 document_path=(row or {}).get("document_path"),
                 query_485_string=(row or {}).get("query_485_string"),
             )
-        return await capture_document_from_url(context, popup_url, order_number)
+        return await capture_document_from_url(context, popup_url, file_id)
 
     if settings.DIRECT_DOWNLOAD_ONLY:
         return {"document_file_path": None}
@@ -888,7 +991,7 @@ async def _capture_document(
         if await row_locator.count() > 0:
             row_view = row_locator.locator("a:has-text('View'), input[value='View']").first
             if await row_view.count() > 0:
-                return await capture_document(context, row_view, order_number)
+                return await capture_document(context, row_view, file_id)
             return {"document_file_path": None}
 
     view_btns = page.locator(
@@ -897,7 +1000,7 @@ async def _capture_document(
     count = await view_btns.count()
     if row_idx >= count:
         return {"document_file_path": None}
-    return await capture_document(context, view_btns.nth(row_idx), order_number)
+    return await capture_document(context, view_btns.nth(row_idx), file_id)
 
 
 def _load_local_output_records() -> list[dict]:
@@ -930,21 +1033,24 @@ async def _capture_row_with_semaphore(
     page: Page,
     row: dict,
     row_idx: int,
-    order_num: str,
+    order_label: str,
+    file_id: str,
     month_key: str,
-) -> tuple[dict, str, str | None]:
+) -> tuple[dict, str, str, str | None]:
     result_row = dict(row)
     err = None
 
     async with semaphore:
         try:
-            doc_data = await _capture_document(context, page, result_row, row_idx, order_num)
+            doc_data = await _capture_document(context, page, result_row, row_idx, file_id)
             result_row.update(doc_data)
         except Exception as e:
             err = str(e)
 
+    result_row["file_id"] = file_id
+    result_row["storage_uid"] = _storage_uid(result_row)
     result_row["date_batch"] = month_key
-    return result_row, order_num, err
+    return result_row, order_label, _failed_retry_key(result_row), err
 
 
 # ── Pagination ────────────────────────────────────────────────────────────────
