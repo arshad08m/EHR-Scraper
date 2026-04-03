@@ -43,6 +43,11 @@ class Settings:
     MONGO_DB:         str = os.getenv("MONGO_DB_NAME",           "kantime_ehr")
     MONGO_COLLECTION: str = os.getenv("MONGO_COLLECTION",        "orders")
 
+    # ── Supabase/Postgres ────────────────────────────────────────────────────
+    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+    SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    SUPABASE_ORDERS_TABLE: str = os.getenv("SUPABASE_ORDERS_TABLE", "orders_ingest")
+
     # ── Paths ─────────────────────────────────────────────────────────────────
     DATA_DIR:        Path = Path("data")
     LOGS_DIR:        Path = Path("logs")

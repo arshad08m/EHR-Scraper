@@ -41,7 +41,7 @@ async def main():
         settings.validate()
     except EnvironmentError as e:
         console.print(f"[bold red]Configuration error:[/bold red] {e}")
-        console.print("Copy config/.env.template → config/.env and fill in credentials.")
+        console.print("Copy config/.env.example → config/.env and fill in credentials.")
         return
 
     months = DEFAULT_MONTHS
@@ -58,7 +58,13 @@ async def main():
     console.rule("[bold cyan]Kantime WorldView Document Scraper[/bold cyan]")
     console.print(f"Months : {[f'{y}-{mo:02d}' for y, mo in months]}")
     console.print(f"Browser: {'headless' if args.headless else 'visible'}")
-    console.print(f"Storage: {'MongoDB Atlas' if settings.MONGO_URI else 'Local JSON (data/orders_output.json)'}")
+    if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY:
+        storage_label = f"Supabase ({settings.SUPABASE_ORDERS_TABLE})"
+    elif settings.MONGO_URI:
+        storage_label = "MongoDB Atlas"
+    else:
+        storage_label = "Local JSON (data/orders_output.json)"
+    console.print(f"Storage: {storage_label}")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(

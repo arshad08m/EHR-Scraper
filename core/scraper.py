@@ -29,7 +29,7 @@ from utils.checkpoint import (
     update_partial_progress, get_resume_state, mark_order_failed,
     get_failed_orders, clear_failed,
 )
-from utils.storage import save_batch
+from utils.storage import save_batch, load_records
 
 console = Console()
 _STOP_REQUESTED = False
@@ -1004,17 +1004,7 @@ async def _capture_document(
 
 
 def _load_local_output_records() -> list[dict]:
-    path = settings.JSON_OUTPUT
-    if not Path(path).exists():
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if isinstance(raw, list):
-            return [r for r in raw if isinstance(r, dict)]
-    except Exception:
-        return []
-    return []
+    return load_records()
 
 
 async def _ensure_retry_session(context: BrowserContext):
